@@ -46,10 +46,14 @@ jobs:
     
     - name: Build installer
       run: |
-        # Find iscc.exe
-        $isccPath = Get-ChildItem -Path "C:\Program Files*" -Filter "ISCC.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-        if (-not $isccPath) {
-          throw "ISCC.exe not found after installation"
+        # Standard Inno Setup installation path
+        $isccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+        if (-not (Test-Path $isccPath)) {
+          Write-Host "Trying alternate path..."
+          $isccPath = "C:\Program Files\Inno Setup 6\ISCC.exe"
+        }
+        if (-not (Test-Path $isccPath)) {
+          throw "ISCC.exe not found at expected paths"
         }
         Write-Host "Using ISCC at: $isccPath"
         
