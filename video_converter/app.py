@@ -1054,8 +1054,6 @@ class ConverterApp(tk.Tk):
         if response:
             webbrowser.open(info.download_url)
             print(f"[update] Opening download page: {info.download_url}", flush=True)
-            "All processing happens on this machine.",
-        )
 
     def open_duplicates(self) -> None:
         if self._duplicates_window is not None:
