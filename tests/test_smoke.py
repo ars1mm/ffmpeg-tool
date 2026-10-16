@@ -168,7 +168,7 @@ class OutputTemplateTests(unittest.TestCase):
         self.assertEqual(converter.sanitize_component('a<b>c:"|*?'), "abc")
 
     def test_slugify(self) -> None:
-        self.assertEqual(converter.slugify("Dua Lipa"), "dua-lipa")
+        self.assertEqual(converter.slugify("Test Artist"), "test-artist")
         self.assertEqual(converter.slugify("  ** "), "clip")
 
     def test_unique_naming_placeholders(self) -> None:
@@ -213,11 +213,11 @@ class OutputTemplateTests(unittest.TestCase):
                 preset,
                 tmp,
                 "{format}/{artist}/{name}.{format}",
-                "Dua Lipa",
+                "Test Artist",
             )
             rel = Path(out).relative_to(tmp).parts
             self.assertEqual(rel[0], "webm")
-            self.assertEqual(rel[1], "Dua Lipa")
+            self.assertEqual(rel[1], "Test Artist")
             self.assertTrue(rel[2].endswith(".webm"))
 
     def test_template_placeholder_fallback(self) -> None:
