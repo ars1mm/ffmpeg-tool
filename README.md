@@ -8,10 +8,10 @@ Everything runs on your machine. No uploads, no accounts, no network access.
 
 ## Features
 
-- **Source library**: point at a root folder (defaults to
-  `C:\Users\arsim\Desktop\facebook\Videos`) and it lists every sub-folder with
-  a video count. Double-click or select folders to queue their videos; the
-  folder name is used as the `{artist}` tag.
+- **Source library**: point at a root folder (e.g., `C:\Videos` or 
+  `D:\MyVideos`) and it lists every sub-folder with a video count. 
+  Double-click or select folders to queue their videos; the folder name is 
+  used as the `{artist}` tag.
 - Batch queue: add individual files or a whole folder
 - Format presets (container / codec / resolution / quality)
 - Flexible output layout via a name template with placeholders
@@ -76,15 +76,16 @@ same video (e.g. two resolutions of the same clip).
 
 ## Source library
 
-The left panel lists the sub-folders of the **Source library** root (default
-`C:\Users\arsim\Desktop\facebook\Videos`), each with the number of video files
+The left panel lists the sub-folders of the **Source library** root (e.g.,
+`C:\Videos` or your chosen folder), each with the number of video files
 it contains (searched recursively). Select one or more folders and click
 **Add selected folders to queue** (or double-click). Each video becomes a job,
 and the containing folder name is used as that job's `{artist}` value.
 
-The default output folder is the parent of the source root (e.g.
-`C:\Users\arsim\Desktop\facebook`), so with the default template the result is
-`facebook\<format>\<artist>\<slug>-<hex5>-<uuid>-<time>.<format>`.
+The default output folder is the parent of the source root (e.g., if your
+source is `C:\Videos\MyCollection`, the output defaults to `C:\Videos`), so 
+with the default template the result is organized by format and artist:
+`Videos\<format>\<artist>\<slug>-<hex5>-<uuid>-<time>.<format>`.
 
 ## Output folder
 
@@ -103,9 +104,9 @@ Results are named from a template. Placeholders:
 | Placeholder | Meaning | Example |
 | --- | --- | --- |
 | `{format}` | output container | `mp4` |
-| `{name}` | source filename stem | `abc123` |
-| `{artist}` | raw artist tag | `jennifer lopez` |
-| `{slug}` | slugified artist (or source name) | `jennifer-lopez` |
+| `{name}` | source filename stem | `clip001` |
+| `{artist}` | raw artist tag | `music artist` |
+| `{slug}` | slugified artist (or source name) | `music-artist` |
 | `{hex5}` | 5 uppercase hex chars | `D827B` |
 | `{uuid}` | random UUIDv4 | `7c8f99ed-e491-...` |
 | `{time}` | current UTC time | `20261012-124030` |
@@ -119,7 +120,7 @@ Path separators in the template create sub-folders. Default template:
 which yields, for example:
 
 ```
-facebook\mp4\jennifer lopez\jennifer-lopez-D827B-7c8f99ed-e491-4844-be40-57a1a0b561a0-20261012-124030.mp4
+Videos\mp4\music artist\music-artist-D827B-7c8f99ed-e491-4844-be40-57a1a0b561a0-20261012-124030.mp4
 ```
 
 Names are sanitized for Windows and never overwritten (a `_converted` suffix

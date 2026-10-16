@@ -181,14 +181,14 @@ class OutputTemplateTests(unittest.TestCase):
                 preset,
                 tmp,
                 "{slug}-{hex5}-{uuid}-{time}.{format}",
-                "Jennifer Lopez",
+                "Test Artist",
             )
             name = Path(out).name
-            self.assertTrue(name.startswith("jennifer-lopez-"))
+            self.assertTrue(name.startswith("test-artist-"))
             self.assertTrue(name.endswith(".mp4"))
             parts = name[:-4].split("-")
-            self.assertEqual(parts[0], "jennifer")
-            self.assertEqual(parts[1], "lopez")
+            self.assertEqual(parts[0], "test")
+            self.assertEqual(parts[1], "artist")
             self.assertEqual(len(parts[2]), 5)
             self.assertTrue(all(c in "0123456789ABCDEF" for c in parts[2]))
 
