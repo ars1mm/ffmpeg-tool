@@ -1,0 +1,5 @@
+# GUI uses only the Python standard library (tkinter).
+# FFmpeg itself is an external binary - install it separately:
+#   winget install Gyan.FFmpeg
+#   or download from https://www.gyan.dev/ffmpeg/builds/
+# Optionally drop ffmpeg.exe / ffprobe.exe into a ./bin folder next to this app.

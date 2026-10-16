@@ -1,0 +1,104 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # Triggers on version tags like v1.0.0, v1.2.3, etc.
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+    
+    - name: Download FFmpeg
+      run: |
+        # Download FFmpeg essentials build
+        Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "ffmpeg.zip"
+        Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg-temp"
+        
+        # Create bin directory and copy binaries
+        New-Item -ItemType Directory -Path "bin" -Force
+        $ffmpegDir = Get-ChildItem -Path "ffmpeg-temp" -Directory | Select-Object -First 1
+        Copy-Item "$($ffmpegDir.FullName)\bin\ffmpeg.exe" -Destination "bin\"
+        Copy-Item "$($ffmpegDir.FullName)\bin\ffprobe.exe" -Destination "bin\"
+    
+    - name: Build executable
+      run: |
+        .\build_exe.ps1
+    
+    - name: Build installer
+      run: |
+        # Download Inno Setup
+        Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile "innosetup.exe"
+        Start-Process -FilePath ".\innosetup.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -Wait
+        
+        # Build installer
+        .\build_installer.ps1
+    
+    - name: Get version from tag
+      id: get_version
+      run: |
+        $version = "${{ github.ref_name }}".TrimStart('v')
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: FFmpeg Video Converter ${{ github.ref_name }}
+        body: |
+          ## FFmpeg Video Converter ${{ github.ref_name }}
+          
+          ### Installation
+          Download and run `FFmpegConverter-Setup.exe` to install the application.
+          
+          ### What's New
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
+          
+          ### Requirements
+          - Windows 10 or later
+          - No additional software required (FFmpeg is bundled)
+          
+          ### Notes
+          - Hardware acceleration (GPU encoding) is automatically detected
+          - First launch may trigger Windows SmartScreen (click "More info" → "Run anyway")
+        draft: false
+        prerelease: false
+    
+    - name: Upload Installer
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./installer_output/FFmpegConverter-Setup.exe
+        asset_name: FFmpegConverter-Setup.exe
+        asset_content_type: application/octet-stream
+    
+    - name: Upload Portable Version
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./dist/FFmpegConverter.zip
+        asset_name: FFmpegConverter-Portable.zip
+        asset_content_type: application/zip
+      continue-on-error: true
