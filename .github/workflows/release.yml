@@ -22,7 +22,28 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pyinstaller
+        pip install pyinstaller pytest
+    
+    - name: Check Python syntax
+      run: |
+        Write-Host "Checking Python syntax..."
+        python -m py_compile main.py
+        Get-ChildItem -Path "video_converter" -Filter "*.py" -Recurse | ForEach-Object {
+          Write-Host "Checking $($_.FullName)..."
+          python -m py_compile $_.FullName
+        }
+        Write-Host "✓ All Python files compile successfully"
+    
+    - name: Test imports
+      run: |
+        Write-Host "Testing module imports..."
+        python -c "from video_converter import app, converter, ffmpeg, presets, version, update_checker; print('✓ All modules import successfully')"
+    
+    - name: Verify entry point structure
+      run: |
+        Write-Host "Verifying main.py structure..."
+        # Just check it compiles and imports resolve, don't run the GUI
+        python -c "import sys; sys.argv = ['main.py']; exec(open('main.py').read(), {'__name__': '__verify__'}); print('✓ main.py is valid')"
     
     - name: Download FFmpeg
       run: |
