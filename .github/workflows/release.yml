@@ -32,18 +32,22 @@ jobs:
           Write-Host "Checking $($_.FullName)..."
           python -m py_compile $_.FullName
         }
-        Write-Host "✓ All Python files compile successfully"
+        Write-Host "[OK] All Python files compile successfully"
     
     - name: Test imports
       run: |
         Write-Host "Testing module imports..."
-        python -c "from video_converter import app, converter, ffmpeg, presets, version, update_checker; print('✓ All modules import successfully')"
+        python -c "from video_converter import app, converter, ffmpeg, presets, version, update_checker; print('[OK] All modules import successfully')"
+      env:
+        PYTHONIOENCODING: utf-8
     
     - name: Verify entry point structure
       run: |
         Write-Host "Verifying main.py structure..."
         # Just check it compiles and imports resolve, don't run the GUI
-        python -c "import sys; sys.argv = ['main.py']; exec(open('main.py').read(), {'__name__': '__verify__'}); print('✓ main.py is valid')"
+        python -c "import sys; sys.argv = ['main.py']; exec(open('main.py').read(), {'__name__': '__verify__'}); print('[OK] main.py is valid')"
+      env:
+        PYTHONIOENCODING: utf-8
     
     - name: Download FFmpeg
       run: |
