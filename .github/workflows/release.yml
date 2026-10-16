@@ -40,14 +40,22 @@ jobs:
       run: |
         .\build_exe.ps1
     
+    - name: Install Inno Setup
+      run: |
+        choco install innosetup -y --no-progress
+    
     - name: Build installer
       run: |
-        # Download Inno Setup
-        Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile "innosetup.exe"
-        Start-Process -FilePath ".\innosetup.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -Wait
+        # Find iscc.exe
+        $isccPath = Get-ChildItem -Path "C:\Program Files*" -Filter "ISCC.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+        if (-not $isccPath) {
+          throw "ISCC.exe not found after installation"
+        }
+        Write-Host "Using ISCC at: $isccPath"
         
-        # Build installer
-        .\build_installer.ps1
+        # Compile installer
+        & $isccPath "installer.iss"
+        if ($LASTEXITCODE -ne 0) { throw "Installer build failed" }
     
     - name: Get version from tag
       id: get_version
