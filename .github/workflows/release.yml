@@ -60,10 +60,35 @@ jobs:
         $ffmpegDir = Get-ChildItem -Path "ffmpeg-temp" -Directory | Select-Object -First 1
         Copy-Item "$($ffmpegDir.FullName)\bin\ffmpeg.exe" -Destination "bin\"
         Copy-Item "$($ffmpegDir.FullName)\bin\ffprobe.exe" -Destination "bin\"
+        Remove-Item "ffmpeg.zip", "ffmpeg-temp" -Recurse -Force -ErrorAction SilentlyContinue
+
+        # Fail loudly if the downloaded build lost hardware encoders.
+        $encoders = & ".\bin\ffmpeg.exe" -hide_banner -encoders 2>&1 | Out-String
+        foreach ($enc in @("h264_nvenc", "hevc_nvenc", "h264_amf", "hevc_amf", "h264_qsv", "hevc_qsv")) {
+          if ($encoders -notmatch [regex]::Escape($enc)) {
+            throw "Bundled FFmpeg build is missing hardware encoder '$enc' - GPU encoding would break."
+          }
+        }
+        Write-Host "[OK] Bundled FFmpeg includes NVENC / AMF / QSV encoders"
     
     - name: Build executable
       run: |
         .\build_exe.ps1
+    
+    - name: Verify bundle contains FFmpeg
+      run: |
+        # The installer must ship ffmpeg/ffprobe or the app falls back to
+        # whatever (possibly non-hardware) ffmpeg the user has on PATH.
+        foreach ($exe in @("dist\FFmpegConverter\bin\ffmpeg.exe", "dist\FFmpegConverter\bin\ffprobe.exe")) {
+          if (-not (Test-Path $exe)) { throw "Missing $exe - build did not bundle FFmpeg." }
+        }
+        $v = & "dist\FFmpegConverter\bin\ffmpeg.exe" -version 2>&1 | Select-Object -First 1
+        Write-Host "[OK] Bundled: $v"
+
+    - name: Create portable zip
+      run: |
+        Compress-Archive -Path "dist\FFmpegConverter\*" -DestinationPath "dist\FFmpegConverter.zip" -Force
+        Write-Host "[OK] Created dist\FFmpegConverter.zip"
     
     - name: Install Inno Setup
       run: |

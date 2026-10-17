@@ -73,6 +73,68 @@ class Preset:
     audio_bitrate: str | None = None
     extra_args: tuple[str, ...] = field(default_factory=tuple)
     audio_only: bool = False
+    palette_gif: bool = False
+    fps: int | None = None
+
+    @property
+    def codec_family(self) -> str | None:
+        """Codec family ('h264', 'hevc', 'vp9', 'av1') or None for non-video."""
+        codec = self.video_codec
+        if codec == "libx264":
+            return "h264"
+        if codec == "libx265":
+            return "hevc"
+        if codec == "libvpx-vp9":
+            return "vp9"
+        if codec and "av1" in codec:
+            return "av1"
+        return None
+
+    def _video_filter(self, crop: Crop | None, hwaccel: str | None) -> str:
+        """Filtergraph for the video stream (palette GIF or plain scale)."""
+        if self.palette_gif:
+            return self._gif_filter(crop, hwaccel)
+        filters: list[str] = []
+        if crop is not None:
+            filters.append(crop.filter_expr())
+        if self.scale:
+            filters.append(f"scale={self.scale}")
+        return ",".join(filters)
+
+    def _gif_filter(self, crop: Crop | None, hwaccel: str | None) -> str:
+        """High-quality GIF pipeline: palettegen + paletteuse.
+
+        Hardware acceleration (when available) handles decode and, on
+        CUDA, the downscale; palette generation and GIF encoding are
+        CPU-only in FFmpeg, so they stay on the CPU.
+        """
+        scale = self.scale or "640:-2"
+        fps = self.fps or 12
+        chain: list[str] = []
+
+        if hwaccel == "cuda":
+            if crop is not None:
+                chain.append(crop.filter_expr())
+            chain += ["hwupload_cuda", f"scale_cuda={scale}:format=yuv420p",
+                      "hwdownload", "format=yuv420p"]
+        elif hwaccel == "qsv":
+            chain += ["hwdownload", "format=nv12"]
+            if crop is not None:
+                chain.append(crop.filter_expr())
+            chain += [f"scale={scale}", "format=yuv420p"]
+        else:
+            if crop is not None:
+                chain.append(crop.filter_expr())
+            if scale:
+                chain.append(f"scale={scale}")
+            chain.append("format=yuv420p")
+
+        head = ",".join(chain)
+        return (
+            f"[0:v]{head},fps={fps},split[s0][s1];"
+            f"[s0]palettegen=stats_mode=diff[p];"
+            f"[s1][p]paletteuse=dither=bayer:bayer_scale=5"
+        )
 
     def ffmpeg_args(
         self,
@@ -81,13 +143,24 @@ class Preset:
         crop: Crop | None = None,
         threads: int | None = None,
         gpu_encoder: str | None = None,
+        hwaccel: str | None = None,
     ) -> list[str]:
-        args: list[str] = ["-y", "-i", source, "-map_metadata", "0"]
+        args: list[str] = ["-y"]
+        if hwaccel and self.palette_gif:
+            args += _HWACCEL_INPUT.get(hwaccel, [])
+        args += ["-i", source, "-map_metadata", "0"]
 
         if self.audio_only:
             args += ["-vn"]
         else:
-            args += ["-map", "0:v:0", "-map", "0:a?"]
+            args += ["-map", "0:v:0"]
+            if self.audio_codec:
+                args += ["-map", "0:a?"]
+            else:
+                # Containers like GIF carry no audio; without this FFmpeg
+                # aborts with "Error selecting an encoder" on sources that
+                # do have an audio stream.
+                args += ["-an"]
 
             gpu = self.gpu_args_for(gpu_encoder) if gpu_encoder else None
             if gpu:
@@ -100,15 +173,13 @@ class Preset:
                 if self.preset and self.video_codec in {"libx264", "libx265"}:
                     args += ["-preset", self.preset]
 
-            filters: list[str] = []
-            if crop is not None:
-                filters.append(crop.filter_expr())
-            if self.scale:
-                filters.append(f"scale={self.scale}")
-            if filters:
-                args += ["-vf", ",".join(filters)]
+            video_filter = self._video_filter(crop, hwaccel)
+            if video_filter:
+                args += ["-vf", video_filter]
 
-            if self.video_codec in {"libx264", "libx265", "libvpx-vp9", "libaom-av1"}:
+            if not self.palette_gif and self.video_codec in {
+                "libx264", "libx265", "libvpx-vp9", "libaom-av1"
+            }:
                 args += ["-pix_fmt", "yuv420p"]
 
         if self.audio_codec:
@@ -129,12 +200,7 @@ class Preset:
             return None
 
         label, family, pix_fmt, quality_args = GPU_ENCODERS[gpu_encoder]
-        target_family = ("h264" if self.video_codec == "libx264"
-                         else "hevc" if self.video_codec == "libx265"
-                         else "vp9" if self.video_codec == "libvpx-vp9"
-                         else "av1" if "av1" in self.video_codec
-                         else None)
-        if family != target_family:
+        if family != self.codec_family:
             return None
 
         quality = self.crf if self.crf is not None else 23
@@ -205,6 +271,34 @@ GPU_ENCODERS: dict[str, tuple[str, str, str, tuple[tuple[str, str], ...]]] = {
         (("global_quality", "{q}"), ("preset", "medium")),
     ),
 }
+
+
+# Input options that switch decoding to the GPU for each acceleration kind.
+_HWACCEL_INPUT: dict[str, list[str]] = {
+    "cuda": ["-hwaccel", "cuda"],
+    # QSV keeps frames as opaque surfaces, so the filtergraph must
+    # hwdownload them before any CPU filter runs.
+    "qsv": ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"],
+    "d3d11va": ["-hwaccel", "d3d11va"],
+}
+
+# Encoder vendor -> hardware acceleration kind (decode / scale).
+_VENDOR_HWACCEL: dict[str, str] = {
+    "nvenc": "cuda",
+    "amf": "d3d11va",
+    "qsv": "qsv",
+}
+
+
+def hwaccel_for_encoders(names: Iterable[str]) -> str | None:
+    """Best hardware acceleration kind for a set of verified encoders.
+
+    Priority matches :func:`auto_encoder_map`: NVIDIA > AMD > Intel.
+    """
+    for vendor in ("nvenc", "amf", "qsv"):
+        if any(vendor in name for name in names):
+            return _VENDOR_HWACCEL[vendor]
+    return None
 
 
 PRESETS: dict[str, Preset] = {
@@ -458,9 +552,10 @@ PRESETS: dict[str, Preset] = {
         key="gif",
         label="GIF (short clips)",
         container="gif",
-        description="Animated GIF, no audio.",
+        description="Animated GIF (GPU decode/scale when available), no audio.",
         scale="640:-2",
-        extra_args=("-r", "12"),
+        palette_gif=True,
+        fps=12,
         audio_only=False,
     ),
 }
@@ -473,23 +568,50 @@ def preset_by_label(label: str) -> Preset:
     raise KeyError(label)
 
 
-def auto_encoder_map(names: Iterable[str]) -> dict[str, str]:
+# Vendor keywords used to map a detected GPU name to its encoder family.
+_VENDOR_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "nvenc": ("nvidia", "geforce", "quadro", "rtx ", "gtx "),
+    "amf": ("amd", "radeon", "ati "),
+    "qsv": ("intel", "arc", "uhd", "iris"),
+}
+
+
+def _vendors_in_gpus(gpus: Iterable[str]) -> set[str]:
+    """Return encoder vendors ('nvenc'/'amf'/'qsv') found in `gpus` names."""
+    found: set[str] = set()
+    for name in gpus:
+        lowered = name.lower()
+        for vendor, keywords in _VENDOR_KEYWORDS.items():
+            if any(keyword in lowered for keyword in keywords):
+                found.add(vendor)
+    return found
+
+
+def auto_encoder_map(
+    names: Iterable[str], gpus: Iterable[str] = ()
+) -> dict[str, str]:
     """Pick the best known hardware encoder per codec family.
 
-    Priority for the same family: NVENC > AMF > QSV.
+    Only verified encoders in `names` are considered. When the machine's
+    GPUs are known, encoders whose hardware is actually installed win
+    over ones that are merely compiled into FFmpeg; ties are broken by
+    quality/speed priority NVENC > AMF > QSV.
     """
     priority = {"nvenc": 0, "amf": 1, "qsv": 2}
-    auto: dict[str, tuple[int, str]] = {}
+    present = _vendors_in_gpus(gpus)
+    auto: dict[str, tuple[tuple[int, int], str]] = {}
     for name in names:
         if name not in GPU_ENCODERS:
             continue
         _, family, _, _ = GPU_ENCODERS[name]
         if family not in ("h264", "hevc", "vp9", "av1"):
             continue
-        vendor = priority[next(k for k in priority if k in name)]
-        if family not in auto or vendor < auto[family][0]:
-            auto[family] = (vendor, name)
-    return {family: name for family, (vendor, name) in auto.items()}
+        vendor_name = next(k for k in priority if k in name)
+        rank = (0 if not present or vendor_name in present else 1,
+                priority[vendor_name])
+        if family not in auto or rank < auto[family][0]:
+            auto[family] = (rank, name)
+    return {family: name for family, (rank, name) in auto.items()}
 
 
 def labels() -> list[str]:

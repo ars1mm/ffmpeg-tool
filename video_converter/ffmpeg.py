@@ -69,18 +69,27 @@ def ffprobe_path() -> str:
     return find_tool("ffprobe")
 
 
-def _run_no_window(args: list[str]) -> subprocess.CompletedProcess:
+def _run_no_window(
+    args: list[str], timeout: float | None = None
+) -> subprocess.CompletedProcess:
     """Run a subprocess without flashing a console window on Windows."""
     creationflags = 0
     if os.name == "nt":
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        creationflags=creationflags,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Return a pseudo-failure instead of hanging the caller.
+        return subprocess.CompletedProcess(
+            args, returncode=124, stdout=exc.stdout or b"", stderr=b"timeout"
+        )
 
 
 @dataclass
@@ -147,7 +156,7 @@ def probe(path: str) -> MediaInfo:
 def list_encoders() -> list[str]:
     """Return the names of all encoders this ffmpeg build knows."""
     try:
-        result = _run_no_window([ffmpeg_path(), "-hide_banner", "-encoders"])
+        result = _run_no_window([ffmpeg_path(), "-hide_banner", "-encoders"], timeout=30)
     except FFmpegNotFoundError:
         return []
     lines = result.stdout.decode("utf-8", errors="replace").splitlines()
@@ -194,15 +203,19 @@ def probe_hardware_encoder(encoder_name: str) -> bool:
         ffmpeg_path(),
         "-hide_banner",
         "-loglevel", "error",
-        # 1-frame 64x64 test source — tiny, fast, no disk I/O
-        "-f", "lavfi", "-i", "color=black:s=64x64:r=1:d=1",
+        # 1-frame test source. The frame must be large enough for the
+        # hardware's minimum encode dimensions - modern NVENC/QSV drivers
+        # reject tiny frames (e.g. 64x64: "Frame Dimension less than the
+        # minimum supported value"), which would make detection report a
+        # working GPU as unavailable. One 1080p frame is still instant.
+        "-f", "lavfi", "-i", "color=black:s=1920x1080:r=1:d=1",
         "-vframes", "1",
         "-c:v", encoder_name,
         "-pix_fmt", pix_fmt,
         "-f", "null", null_out,
     ]
     try:
-        result = _run_no_window(args)
+        result = _run_no_window(args, timeout=60)
         success = result.returncode == 0
         if not success and result.stderr:
             error_msg = result.stderr.decode("utf-8", errors="replace").strip()
@@ -232,7 +245,7 @@ def verified_hardware_encoders(known: list[str]) -> list[str]:
     verified: list[str] = []
     for name in candidates:
         ok = probe_hardware_encoder(name)
-        status = "✓ AVAILABLE" if ok else "✗ not available"
+        status = "AVAILABLE" if ok else "not available"
         print(f"[gpu]   {name}: {status}", flush=True)
         if ok:
             verified.append(name)
@@ -245,13 +258,71 @@ def verified_hardware_encoders(known: list[str]) -> list[str]:
     return verified
 
 
+@lru_cache(maxsize=None)
+def detect_gpus() -> list[str]:
+    """Best-effort list of installed display adapters. Never raises.
+
+    Used to rank hardware encoders by the GPUs the machine actually has
+    (and to tell the user which GPU will be used).
+    """
+    names: list[str] = []
+
+    def _add(text: str) -> None:
+        seen = {n.lower() for n in names}
+        for line in text.splitlines():
+            name = line.strip().strip("\x00")
+            if name and name.lower() not in seen:
+                names.append(name)
+                seen.add(name.lower())
+
+    if os.name == "nt":
+        # Exact NVIDIA adapter names when the driver ships nvidia-smi.
+        smi = shutil.which("nvidia-smi")
+        if smi:
+            try:
+                r = _run_no_window(
+                    [smi, "--query-gpu=name", "--format=csv,noheader"],
+                    timeout=10,
+                )
+                if r.returncode == 0:
+                    _add(r.stdout.decode("utf-8", errors="replace"))
+            except OSError:
+                pass
+        # Every installed adapter (Intel / AMD / NVIDIA) via WMI.
+        ps = "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }"
+        try:
+            r = _run_no_window(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                timeout=20,
+            )
+            if r.returncode == 0:
+                _add(r.stdout.decode("utf-8", errors="replace"))
+        except OSError:
+            pass
+    else:
+        try:
+            r = _run_no_window(["lspci", "-mm"], timeout=10)
+            if r.returncode == 0:
+                for line in r.stdout.decode("utf-8", errors="replace").splitlines():
+                    if line.startswith(
+                        ("VGA compatible controller", "3D controller",
+                         "Display controller")
+                    ):
+                        quoted = re.findall(r'"([^"]+)"', line)
+                        _add(" ".join(quoted) if quoted else line)
+        except OSError:
+            pass
+
+    return names
+
+
 def verify_ffmpeg() -> tuple[str, str]:
     """Confirm both binaries respond; return (ffmpeg, ffprobe) versions."""
     ffmpeg = ffmpeg_path()
     ffprobe = ffprobe_path()
 
     def _version(binary: str) -> str:
-        out = _run_no_window([binary, "-version"]).stdout.decode(
+        out = _run_no_window([binary, "-version"], timeout=30).stdout.decode(
             "utf-8", errors="replace"
         )
         return out.splitlines()[0] if out else "unknown"

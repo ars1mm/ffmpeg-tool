@@ -132,6 +132,15 @@ def output_path_for(source: str, preset: Preset, out_dir: str | None) -> str:
 
 
 
+def threads_for_job(cpu_threads: int, active_jobs: int) -> int:
+    """CPU threads to give each job when `active_jobs` run concurrently.
+
+    All available threads go to a single video; with several videos in
+    flight the cores are split evenly. Always returns at least 1.
+    """
+    return max(1, cpu_threads // max(1, active_jobs))
+
+
 def _parse_progress_line(line: str, duration: float) -> float | None:
     if "=" not in line:
         return None
@@ -160,12 +169,15 @@ def convert(
     on_progress: ProgressCallback | None = None,
     threads: int | None = None,
     gpu_encoder: str | None = None,
+    hwaccel: str | None = None,
 ) -> ConversionResult:
     """Transcode a single file. Blocking; run from a worker thread.
 
     When `threads` is set, the encoder and filters are pinned to that many
     CPU threads so a caller can bound total CPU usage across a pool.
     When `gpu_encoder` is set, compatible presets use that hardware encoder.
+    When `hwaccel` is set, presets that support it (palette GIFs) decode and
+    scale on the GPU; if that path fails it is retried once on the CPU.
     """
     cancel_event = cancel_event or threading.Event()
     on_progress = on_progress or (lambda _frac, _msg: None)
@@ -184,84 +196,93 @@ def convert(
             source, None, False, False, f"Cannot create output folder: {exc}", ""
         )
 
-    args = [
-        ffmpeg.ffmpeg_path(),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostats",
-    ]
-    if threads:
-        args += [
-            "-filter_threads",
-            str(threads),
-            "-filter_complex_threads",
-            str(threads),
+    def attempt(accel: str | None) -> ConversionResult:
+        args = [
+            ffmpeg.ffmpeg_path(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
         ]
-    args += [
-        "-progress",
-        "pipe:1",
-        *preset.ffmpeg_args(source, destination, crop, threads, gpu_encoder),
-    ]
+        if threads:
+            args += [
+                "-filter_threads",
+                str(threads),
+                "-filter_complex_threads",
+                str(threads),
+            ]
+        args += [
+            "-progress",
+            "pipe:1",
+            *preset.ffmpeg_args(
+                source, destination, crop, threads, gpu_encoder, accel
+            ),
+        ]
 
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-    log_lines: list[str] = []
-    try:
-        process = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=creationflags,
-        )
-    except OSError as exc:
-        return ConversionResult(source, None, False, False, str(exc), "")
+        log_lines: list[str] = []
+        try:
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            return ConversionResult(source, None, False, False, str(exc), "")
 
-    assert process.stdout is not None
-    try:
-        for line in process.stdout:
-            if cancel_event.is_set():
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                _cleanup(destination)
-                return ConversionResult(
-                    source, None, False, True, "Cancelled", "".join(log_lines)
-                )
+        assert process.stdout is not None
+        try:
+            for line in process.stdout:
+                if cancel_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    _cleanup(destination)
+                    return ConversionResult(
+                        source, None, False, True, "Cancelled", "".join(log_lines)
+                    )
 
-            line = line.strip()
-            if not line:
-                continue
-            frac = _parse_progress_line(line, duration)
-            if frac is not None:
-                on_progress(frac, f"{int(frac * 100)}%")
-            elif "frame=" in line or "error" in line.lower():
-                log_lines.append(line)
-    finally:
-        process.stdout.close()
+                line = line.strip()
+                if not line:
+                    continue
+                frac = _parse_progress_line(line, duration)
+                if frac is not None:
+                    on_progress(frac, f"{int(frac * 100)}%")
+                elif "frame=" in line or "error" in line.lower():
+                    log_lines.append(line)
+        finally:
+            process.stdout.close()
 
-    returncode = process.wait()
-    log = "\n".join(log_lines)
+        returncode = process.wait()
+        log = "\n".join(log_lines)
 
-    if cancel_event.is_set():
+        if cancel_event.is_set():
+            _cleanup(destination)
+            return ConversionResult(source, None, False, True, "Cancelled", log)
+
+        if returncode == 0:
+            on_progress(1.0, "100%")
+            return ConversionResult(source, destination, True, False, "Done", log)
+
         _cleanup(destination)
-        return ConversionResult(source, None, False, True, "Cancelled", log)
+        return ConversionResult(
+            source, None, False, False, f"FFmpeg exited with code {returncode}", log
+        )
 
-    if returncode == 0:
-        on_progress(1.0, "100%")
-        return ConversionResult(source, destination, True, False, "Done", log)
-
-    _cleanup(destination)
-    return ConversionResult(
-        source, None, False, False, f"FFmpeg exited with code {returncode}", log
-    )
+    result = attempt(hwaccel)
+    if not result.success and not result.cancelled and hwaccel:
+        on_progress(0.0, "GPU path failed, retrying on CPU")
+        result = attempt(None)
+    return result
 
 
 def _cleanup(destination: str) -> None:

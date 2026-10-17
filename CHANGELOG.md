@@ -5,6 +5,27 @@ All notable changes to FFmpeg Video Converter will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-10-17
+
+### Added
+- Activity log panel in the app showing where each file is saved, per-job
+  results, GPU selection and batch summaries, with Copy and Clear buttons.
+- Hardware-aware encoder auto-selection: detected GPUs are preferred and
+  the best verified encoder is chosen per codec family.
+- GPU-accelerated GIF creation (GPU decode/scale; palette stays on CPU).
+- High-quality GIF palette pipeline (palettegen/paletteuse).
+
+### Fixed
+- GPU encoding now works in the packaged installer: the encoder probe no
+  longer uses an undersized 64x64 test frame that modern NVENC/QSV reject.
+- The installer now always bundles ffmpeg/ffprobe (was copied from PATH in
+  some builds, so GPU encoding silently fell back to CPU or broke).
+- GIF conversions no longer fail with "Error selecting an encoder" when the
+  source has an audio stream (GIFs now drop audio explicitly).
+- A failed GPU path now retries once on the CPU instead of failing the job.
+- All CPU cores are used for a single video, split evenly across concurrent
+  jobs when several run at once.
+
 ## [1.0.1] - 2026-10-16
 
 ### Fixed

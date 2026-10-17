@@ -27,11 +27,20 @@ Write-Host "Using Python: $PythonExe"
 & $PythonExe -m pip install --disable-pip-version-check --quiet pyinstaller
 if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller failed." }
 
-# Locate the linked ffmpeg/ffprobe binaries to bundle beside the app.
-$FfmpegExe  = (Get-Command ffmpeg  -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
-$FfprobeExe = (Get-Command ffprobe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+# Locate the ffmpeg/ffprobe binaries to bundle beside the app.
+# Prefer an already-downloaded .\bin folder (used by CI) over PATH.
+$LocalFfmpeg  = Join-Path (Get-Location) "bin\ffmpeg.exe"
+$LocalFfprobe = Join-Path (Get-Location) "bin\ffprobe.exe"
+if ((Test-Path $LocalFfmpeg) -and (Test-Path $LocalFfprobe)) {
+    $FfmpegExe  = $LocalFfmpeg
+    $FfprobeExe = $LocalFfprobe
+    Write-Host "Using local bin\ffmpeg.exe and bin\ffprobe.exe"
+} else {
+    $FfmpegExe  = (Get-Command ffmpeg  -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+    $FfprobeExe = (Get-Command ffprobe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+}
 if (-not $FfmpegExe -or -not $FfprobeExe) {
-    Write-Warning "ffmpeg/ffprobe not found on PATH - the built app will need them in dist\FFmpegConverter\bin."
+    throw "ffmpeg/ffprobe not found. Download them into .\bin\ or add them to PATH."
 }
 
 # Build arguments common to both modes.

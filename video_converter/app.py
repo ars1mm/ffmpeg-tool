@@ -8,6 +8,7 @@ import queue
 import threading
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -54,6 +55,7 @@ class ConverterApp(tk.Tk):
         self.workers = tk.IntVar(value=self.worker_threads)
         self.gpu_encoders: dict[str, str] = {}
         self.gpu_auto: dict[str, str] = {}
+        self.gpu_devices: list[str] = []
         self.gpu_label = tk.StringVar(value=CPU_LABEL)
 
         self.jobs: list[Job] = []
@@ -159,8 +161,10 @@ class ConverterApp(tk.Tk):
         self.clear_button.pack(side="left", padx=(6, 0))
 
     def _build_body(self) -> None:
-        body = ttk.PanedWindow(self, orient="horizontal")
-        body.pack(fill="both", expand=True)
+        vertical = ttk.PanedWindow(self, orient="vertical")
+        vertical.pack(fill="both", expand=True)
+
+        body = ttk.PanedWindow(vertical, orient="horizontal")
         left = ttk.Frame(body)
         right = ttk.Frame(body)
         body.add(left, weight=2)
@@ -168,6 +172,77 @@ class ConverterApp(tk.Tk):
         self._build_library(left)
         self._build_queue_view(right)
         self._build_controls(right)
+
+        log_frame = ttk.Frame(vertical)
+        self._build_log_panel(log_frame)
+        vertical.add(body, weight=4)
+        vertical.add(log_frame, weight=1)
+
+    def _build_log_panel(self, parent: tk.Misc) -> None:
+        header = ttk.Frame(parent, padding=(8, 6, 8, 0))
+        header.pack(fill="x")
+        ttk.Label(header, text="Activity log").pack(side="left")
+        self.copy_log_button = ttk.Button(
+            header, text="Copy", width=7, command=self.copy_log
+        )
+        self.copy_log_button.pack(side="right")
+        self.clear_log_button = ttk.Button(
+            header, text="Clear", width=7, command=self.clear_log
+        )
+        self.clear_log_button.pack(side="right", padx=(0, 6))
+
+        wrap = ttk.Frame(parent, padding=(8, 4, 8, 8))
+        wrap.pack(fill="both", expand=True)
+        self.log_text = tk.Text(
+            wrap,
+            height=8,
+            wrap="none",
+            state="disabled",
+            font=("Consolas", 9),
+            relief="flat",
+            borderwidth=1,
+        )
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+
+        self.log_text.tag_configure("info", foreground="#1f2328")
+        self.log_text.tag_configure("save", foreground="#1a4fb4")
+        self.log_text.tag_configure("done", foreground="#1a7f37")
+        self.log_text.tag_configure("failed", foreground="#cf222e")
+        self.log_text.tag_configure("cancel", foreground="#9a6700")
+        self.log_text.tag_configure("gpu", foreground="#8250df")
+
+    def clear_log(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def copy_log(self) -> None:
+        text = self.log_text.get("1.0", "end-1c")
+        if not text:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_text.set("Activity log copied to clipboard")
+
+    def _append_log(self, line: str, level: str = "info") -> None:
+        if not hasattr(self, "log_text"):
+            return
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", line + "\n", level)
+        # Bound memory for very long sessions.
+        if int(self.log_text.index("end-1c").split(".")[0]) > 5000:
+            self.log_text.delete("1.0", "1000.0")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _log(self, message: str, level: str = "info") -> None:
+        """Show a message in the activity log and mirror it to stdout."""
+        print(message, flush=True)
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+        self._ui_queue.put(("log", line, level))
 
     def _build_library(self, parent: tk.Misc) -> None:
         frame = ttk.Frame(parent, padding=(8, 8))
@@ -252,7 +327,10 @@ class ConverterApp(tk.Tk):
 
         self.preset_desc = ttk.Label(frame, text="", foreground="#666")
         self.preset_desc.grid(row=0, column=2, columnspan=2, sticky="w")
-        combo.bind("<<ComboboxSelected>>", lambda _e: self._update_preset_desc())
+        combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: (self._update_preset_desc(), self._update_encoder_hint()),
+        )
         self._update_preset_desc()
 
         ttk.Label(frame, text="Output folder:").grid(
@@ -415,16 +493,24 @@ class ConverterApp(tk.Tk):
             n = self.worker_threads
         if self._gpu_active():
             n = min(n, GPU_WORKER_MAX)
+            threads = self._threads_per_job(n)
             self.workers_hint.config(
-                text=f"GPU encoder: max {GPU_WORKER_MAX} concurrent jobs "
-                f"(1 NVENC/QSV session each)"
+                text=f"GPU encoder: max {GPU_WORKER_MAX} concurrent jobs, "
+                f"{threads} thread(s)/job for scaling filters"
             )
             return
         n = max(1, min(self.cpu_count, n))
-        pct = round(n / self.cpu_count * 100)
+        threads = self._threads_per_job(n)
+        pct = min(100, round(threads * n / self.cpu_count * 100))
         self.workers_hint.config(
-            text=f"1 thread/job, ~{pct}% of {self.cpu_count} logical CPUs"
+            text=f"{threads} thread(s)/job x up to {n} parallel job(s), "
+            f"~{pct}% of {self.cpu_count} logical CPUs"
         )
+
+    def _threads_per_job(self, workers: int) -> int:
+        """Threads each job gets: cores split across the jobs in flight."""
+        jobs = len(self.jobs) if self.jobs else workers
+        return converter.threads_for_job(self.cpu_count, min(workers, jobs))
 
     def edit_custom_crop(self) -> None:
         dialog = _CropDialog(self, self.custom_crop)
@@ -528,6 +614,7 @@ class ConverterApp(tk.Tk):
             self._insert_job_row(job)
             self._probe_job_async(job)
         self.status_text.set(f"{len(self.jobs)} file(s) in queue")
+        self._update_workers_hint()
 
     def _insert_job_row(self, job: Job) -> None:
         job.item_id = self.tree.insert(
@@ -556,6 +643,7 @@ class ConverterApp(tk.Tk):
             self.tree.delete(item)
             self.jobs = [job for job in self.jobs if job.item_id != item]
         self.status_text.set(f"{len(self.jobs)} file(s) in queue")
+        self._update_workers_hint()
 
     def clear_queue(self) -> None:
         if self._is_running():
@@ -566,6 +654,7 @@ class ConverterApp(tk.Tk):
         self.jobs.clear()
         self.overall.set(0.0)
         self.status_text.set("Queue cleared")
+        self._update_workers_hint()
 
     def choose_output(self) -> None:
         folder = filedialog.askdirectory(title="Choose output folder")
@@ -692,7 +781,7 @@ class ConverterApp(tk.Tk):
         if out_dir and not Path(out_dir).is_dir():
             try:
                 Path(out_dir).mkdir(parents=True, exist_ok=True)
-                print(f"[info] created output folder: {out_dir}", flush=True)
+                self._log(f"Created output folder: {out_dir}")
             except OSError as exc:
                 messagebox.showerror(
                     "Cannot create folder",
@@ -704,10 +793,10 @@ class ConverterApp(tk.Tk):
 
         workers = self._clamp_workers()
         if self._gpu_active():
-            print(
-                f"[gpu] hardware encoding: capped to {workers} concurrent "
+            self._log(
+                f"Hardware encoding: capped to {workers} concurrent "
                 f"job(s), 1 encoder session each",
-                flush=True,
+                "gpu",
             )
         chosen = self.preset_label.get()
         for job in self.jobs:
@@ -744,9 +833,11 @@ class ConverterApp(tk.Tk):
         jobs = list(self.jobs)
         total = len(jobs)
         workers = max(1, min(config.get("workers", 1), total))
-        print(
-            f"[pool] {total} job(s), {workers} worker(s), 1 thread/job",
-            flush=True,
+        threads = converter.threads_for_job(self.cpu_count, workers)
+        config["threads_per_job"] = threads
+        self._log(
+            f"Pool: {total} job(s), {workers} worker(s), "
+            f"{threads} thread(s)/job on {self.cpu_count} logical CPU(s)"
         )
 
         work: queue.Queue = queue.Queue()
@@ -763,7 +854,7 @@ class ConverterApp(tk.Tk):
                     self._process_job(job, config)
                 except Exception as exc:  # noqa: BLE001 - keep pool alive
                     job.status = f"Failed: {exc}"
-                    print(f"[error] {job.source}: {exc}", flush=True)
+                    self._log(f"Error: {job.source}: {exc}", "failed")
                     self._ui_queue.put(("row", job))
                 finally:
                     work.task_done()
@@ -800,16 +891,17 @@ class ConverterApp(tk.Tk):
         crop = self._crop_for(config["crop_label"], config["custom_crop"], job)
         gpu_option = config.get("gpu_encoder")
         gpu_encoder = self._resolve_gpu_encoder(preset, config)
-        if gpu_option and gpu_encoder is None:
-            print(
-                f"[gpu] no {'GPU encoder' if gpu_option == GPU_AUTO_LABEL else gpu_option} "
+        hwaccel = self._resolve_hwaccel(config)
+        if gpu_option and gpu_encoder is None and not preset.palette_gif:
+            self._log(
+                f"No {'GPU encoder' if gpu_option == GPU_AUTO_LABEL else gpu_option} "
                 f"for '{preset.key}' preset - using CPU",
-                flush=True,
+                "gpu",
             )
         job.destination = destination
         job.status = "Converting"
         self._ui_queue.put(("row", job))
-        print(f"[save] {destination}", flush=True)
+        self._log(f"Saving {Path(job.source).name} to: {destination}", "save")
 
         result = converter.convert(
             job.source,
@@ -820,20 +912,21 @@ class ConverterApp(tk.Tk):
             on_progress=lambda frac, msg, j=job: self._ui_queue.put(
                 ("progress", j, frac, msg)
             ),
-            threads=1,
+            threads=config.get("threads_per_job", 1),
             gpu_encoder=gpu_encoder,
+            hwaccel=hwaccel,
         )
 
         if result.cancelled:
             job.status = "Cancelled"
-            print(f"[cancel] {destination}", flush=True)
+            self._log(f"Cancelled: {destination}", "cancel")
         elif result.success:
             job.status = "Done"
             job.progress = 1.0
-            print(f"[done] {destination}", flush=True)
+            self._log(f"Saved: {destination}", "done")
         else:
             job.status = f"Failed: {result.message}"
-            print(f"[failed] {job.source}: {result.message}", flush=True)
+            self._log(f"Failed: {job.source}: {result.message}", "failed")
         self._ui_queue.put(("row", job))
 
     def cancel(self) -> None:
@@ -853,7 +946,9 @@ class ConverterApp(tk.Tk):
 
     def _handle_message(self, message: tuple) -> None:
         kind = message[0]
-        if kind == "probe":
+        if kind == "log":
+            self._append_log(message[1], message[2] if len(message) > 2 else "info")
+        elif kind == "probe":
             _, job, info = message
             job.width = info.width
             job.height = info.height
@@ -890,6 +985,7 @@ class ConverterApp(tk.Tk):
             self._set_running(False)
             if cancelled:
                 self.status_text.set("Cancelled")
+                self._log("Conversion cancelled", "cancel")
             else:
                 done = sum(1 for j in self.jobs if j.status == "Done")
                 failed = sum(1 for j in self.jobs if j.status.startswith("Failed"))
@@ -899,12 +995,15 @@ class ConverterApp(tk.Tk):
                 if failed:
                     text += f", {failed} failed"
                 self.status_text.set(text)
+                level = "failed" if failed else "done"
+                self._log(text, level)
         elif kind == "gpu_detected":
             names: list[str] = message[1]
+            self.gpu_devices = list(message[2]) if len(message) > 2 else []
             self.gpu_encoders = {
                 presets.GPU_ENCODERS[name][0]: name for name in names
             }
-            self.gpu_auto = presets.auto_encoder_map(names)
+            self.gpu_auto = presets.auto_encoder_map(names, self.gpu_devices)
 
             values = [CPU_LABEL]
             if self.gpu_auto:
@@ -919,15 +1018,29 @@ class ConverterApp(tk.Tk):
             self._update_encoder_hint()
             self._update_workers_hint()
 
+            if self.gpu_devices:
+                self._log(
+                    f"Detected GPU(s): {', '.join(self.gpu_devices)}", "gpu"
+                )
             if names:
                 labels = ", ".join(
                     presets.GPU_ENCODERS[n][0].split("(")[0].strip() for n in names
                 )
+                auto_desc = ", ".join(
+                    f"{f}:{n}" for f, n in sorted(self.gpu_auto.items())
+                )
+                gpu_desc = (
+                    f" - {', '.join(self.gpu_devices)}"
+                    if self.gpu_devices else ""
+                )
                 self.status_text.set(f"✓ Hardware acceleration ready: {labels}")
-                print(f"[gpu] Detected and verified: {', '.join(names)}", flush=True)
+                self._log(f"Encoders detected and verified: {', '.join(names)}", "gpu")
+                self._log(f"Auto selection: {auto_desc}{gpu_desc}", "gpu")
             else:
                 self.status_text.set("No GPU encoders detected — using CPU (software encoding)")
-                print("[gpu] No hardware encoders available, falling back to CPU", flush=True)
+                self._log(
+                    "No hardware encoders available, falling back to CPU", "gpu"
+                )
         
         elif kind == "update_check":
             info: update_checker.UpdateInfo = message[1]
@@ -962,9 +1075,16 @@ class ConverterApp(tk.Tk):
             version, _ = ffmpeg.verify_ffmpeg()
         except ffmpeg.FFmpegNotFoundError as exc:
             self.status_text.set("FFmpeg not found")
+            self._log(f"FFmpeg not found: {exc}", "failed")
             messagebox.showerror("FFmpeg not found", str(exc))
             return
         self.status_text.set(version)
+        self._log(f"FFmpeg ready: {version}")
+        out_dir = self.output_dir.get().strip()
+        self._log(
+            "Converted files will be saved to: "
+            + (out_dir if out_dir else "the folder next to each source file")
+        )
 
     def _detect_gpu(self) -> None:
         self.status_text.set("Detecting GPU encoders…")
@@ -975,7 +1095,11 @@ class ConverterApp(tk.Tk):
                 names = ffmpeg.verified_hardware_encoders(encoder_keys)
             except ffmpeg.FFmpegNotFoundError:
                 names = []
-            self._ui_queue.put(("gpu_detected", names))
+            try:
+                gpus = ffmpeg.detect_gpus()
+            except Exception:
+                gpus = []
+            self._ui_queue.put(("gpu_detected", names, gpus))
 
         threading.Thread(target=probe_thread, daemon=True).start()
 
@@ -989,14 +1113,36 @@ class ConverterApp(tk.Tk):
         threading.Thread(target=check_thread, daemon=True).start()
 
     def _update_encoder_hint(self) -> None:
-        if self.gpu_label.get() == GPU_AUTO_LABEL:
-            mapped = [(f, v) for f in ("h264", "hevc", "vp9", "av1")
-                      if (v := self.gpu_auto.get(f))]
-            detail = ", ".join(f"{k}:{v}" for k, v in mapped)
-            self.encoder_hint.config(text=f"auto GPU: {detail}")
-        elif self.gpu_label.get() in self.gpu_encoders:
-            name = self.gpu_encoders[self.gpu_label.get()]
-            self.encoder_hint.config(text=f"forced encoder: {name}")
+        option = self.gpu_label.get()
+        gpu_note = f"  ({' + '.join(self.gpu_devices)})" if self.gpu_devices else ""
+        if option == GPU_AUTO_LABEL:
+            preset = presets.preset_by_label(self.preset_label.get())
+            family = preset.codec_family
+            chosen = self.gpu_auto.get(family) if family else None
+            if chosen:
+                label = presets.GPU_ENCODERS[chosen][0].split("(")[0].strip()
+                self.encoder_hint.config(
+                    text=f"auto: {label} for this preset{gpu_note}"
+                )
+            elif preset.palette_gif:
+                hwaccel = self._resolve_hwaccel({"gpu_encoder": option})
+                if hwaccel:
+                    self.encoder_hint.config(
+                        text=f"auto: GPU {hwaccel} decode + scale for GIF{gpu_note}"
+                    )
+                else:
+                    self.encoder_hint.config(
+                        text="auto: CPU palette GIF (no GPU available)"
+                    )
+            elif not family:
+                self.encoder_hint.config(text="auto: no video track in this preset")
+            else:
+                self.encoder_hint.config(
+                    text=f"auto: no hardware {family} encoder - using CPU"
+                )
+        elif option in self.gpu_encoders:
+            name = self.gpu_encoders[option]
+            self.encoder_hint.config(text=f"forced encoder: {name}{gpu_note}")
         else:
             self.encoder_hint.config(
                 text="no hardware encoder found - using CPU (x264/x265)"
@@ -1009,19 +1155,26 @@ class ConverterApp(tk.Tk):
         if not option:
             return None
         if option == GPU_AUTO_LABEL:
-            family = (
-                "hevc"
-                if preset.video_codec == "libx265"
-                else "h264"
-                if preset.video_codec == "libx264"
-                else "vp9"
-                if preset.video_codec == "libvpx-vp9"
-                else "av1"
-                if preset.video_codec and "av1" in preset.video_codec
-                else None
-            )
+            family = preset.codec_family
             return self.gpu_auto.get(family) if family else None
         return option
+
+    def _resolve_hwaccel(self, config: dict) -> str | None:
+        """Hardware acceleration kind for GPU decode/scale.
+
+        Derived from the chosen GPU encoders rather than the codec family,
+        because GIFs have no hardware encoder of their own yet can still
+        decode and scale on the GPU.
+        """
+        option = config.get("gpu_encoder")
+        if not option:
+            return None
+        if option == GPU_AUTO_LABEL:
+            names = list(self.gpu_auto.values())
+        else:
+            name = self.gpu_encoders.get(option)
+            names = [name] if name else []
+        return presets.hwaccel_for_encoders(names)
 
     def _about(self) -> None:
         messagebox.showinfo(
@@ -1053,7 +1206,7 @@ class ConverterApp(tk.Tk):
         
         if response:
             webbrowser.open(info.download_url)
-            print(f"[update] Opening download page: {info.download_url}", flush=True)
+            self._log(f"Opening download page: {info.download_url}")
 
     def open_duplicates(self) -> None:
         if self._duplicates_window is not None:

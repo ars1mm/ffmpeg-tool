@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from video_converter import converter, ffmpeg, presets
 
@@ -110,6 +111,111 @@ class PresetTests(unittest.TestCase):
         result = presets.auto_encoder_map(["made_up_encoder"])
         self.assertEqual(result, {})
 
+    def test_codec_family_property(self) -> None:
+        self.assertEqual(presets.PRESETS["mp4_h264_1080"].codec_family, "h264")
+        self.assertEqual(presets.PRESETS["mp4_h265"].codec_family, "hevc")
+        self.assertEqual(presets.PRESETS["webm_vp9"].codec_family, "vp9")
+        self.assertEqual(presets.PRESETS["mp4_av1"].codec_family, "av1")
+        self.assertIsNone(presets.PRESETS["audio_mp3"].codec_family)
+        self.assertIsNone(presets.PRESETS["gif"].codec_family)
+
+    def test_auto_map_uses_detected_gpu_vendor(self) -> None:
+        encoders = ["h264_nvenc", "h264_qsv", "hevc_nvenc", "hevc_qsv"]
+        intel_only = presets.auto_encoder_map(
+            encoders, ["Intel(R) UHD Graphics 770"]
+        )
+        self.assertEqual(intel_only, {"h264": "h264_qsv", "hevc": "hevc_qsv"})
+
+        nvidia = presets.auto_encoder_map(
+            encoders, ["NVIDIA GeForce RTX 5060 Ti", "Intel UHD Graphics 770"]
+        )
+        self.assertEqual(nvidia, {"h264": "h264_nvenc", "hevc": "hevc_nvenc"})
+
+        amd = presets.auto_encoder_map(
+            ["h264_amf", "h264_qsv", "hevc_amf"], ["AMD Radeon RX 7800 XT"]
+        )
+        self.assertEqual(amd, {"h264": "h264_amf", "hevc": "hevc_amf"})
+
+    def test_auto_map_without_gpu_info_keeps_default_priority(self) -> None:
+        result = presets.auto_encoder_map(
+            ["h264_qsv", "h264_amf", "h264_nvenc"], []
+        )
+        self.assertEqual(result["h264"], "h264_nvenc")
+
+    def test_gpu_args_rejected_for_non_video_preset(self) -> None:
+        self.assertIsNone(
+            presets.PRESETS["audio_mp3"].gpu_args_for("h264_nvenc")
+        )
+        self.assertIsNone(presets.PRESETS["gif"].gpu_args_for("h264_nvenc"))
+
+    def test_gif_drops_audio_stream(self) -> None:
+        gif = presets.PRESETS["gif"]
+        args = gif.ffmpeg_args("in.mov", "out.gif")
+        self.assertIn("-an", args)
+        self.assertNotIn("0:a?", args)
+
+    def test_gif_uses_palette_filtergraph(self) -> None:
+        gif = presets.PRESETS["gif"]
+        args = gif.ffmpeg_args("in.mov", "out.gif")
+        graph = args[args.index("-vf") + 1]
+        self.assertIn("palettegen", graph)
+        self.assertIn("paletteuse", graph)
+        self.assertIn("fps=12", graph)
+        self.assertNotIn("-pix_fmt", args)
+
+    def test_gif_hwaccel_cuda_places_option_before_input(self) -> None:
+        gif = presets.PRESETS["gif"]
+        args = gif.ffmpeg_args("in.mov", "out.gif", hwaccel="cuda")
+        self.assertEqual(args[args.index("-hwaccel") + 1], "cuda")
+        self.assertLess(args.index("-hwaccel"), args.index("in.mov"))
+        graph = args[args.index("-vf") + 1]
+        self.assertIn("hwupload_cuda", graph)
+        self.assertIn("scale_cuda=640:-2", graph)
+        self.assertIn("hwdownload", graph)
+
+    def test_gif_hwaccel_qsv_downloads_surfaces(self) -> None:
+        gif = presets.PRESETS["gif"]
+        args = gif.ffmpeg_args("in.mov", "out.gif", hwaccel="qsv")
+        self.assertEqual(args[args.index("-hwaccel") + 1], "qsv")
+        self.assertEqual(
+            args[args.index("-hwaccel_output_format") + 1], "qsv"
+        )
+        graph = args[args.index("-vf") + 1]
+        self.assertIn("hwdownload,format=nv12", graph)
+
+    def test_hwaccel_ignored_for_non_gif_presets(self) -> None:
+        mp4 = presets.PRESETS["mp4_h264_1080"]
+        args = mp4.ffmpeg_args("in.mov", "out.mp4", hwaccel="cuda")
+        self.assertNotIn("-hwaccel", args)
+
+    def test_hwaccel_for_encoders_maps_vendors(self) -> None:
+        self.assertEqual(
+            presets.hwaccel_for_encoders(["h264_nvenc"]), "cuda"
+        )
+        self.assertEqual(
+            presets.hwaccel_for_encoders(["h264_qsv", "hevc_qsv"]), "qsv"
+        )
+        self.assertEqual(
+            presets.hwaccel_for_encoders(["h264_amf"]), "d3d11va"
+        )
+        self.assertEqual(
+            presets.hwaccel_for_encoders(["h264_nvenc", "h264_qsv"]), "cuda"
+        )
+        self.assertIsNone(presets.hwaccel_for_encoders(["libx264"]))
+
+
+class GpuDetectionTests(unittest.TestCase):
+    def test_detect_gpus_returns_name_list(self) -> None:
+        gpus = ffmpeg.detect_gpus()
+        self.assertIsInstance(gpus, list)
+        self.assertTrue(all(isinstance(name, str) and name for name in gpus))
+
+    def test_probe_hardware_encoder_never_raises(self) -> None:
+        # Result depends on the machine; only guarantee a clean bool back.
+        self.assertIn(
+            ffmpeg.probe_hardware_encoder("h264_nvenc"), (True, False)
+        )
+
 
 class FormatPresetTests(unittest.TestCase):
     def test_webm_vp9_uses_vorbis_audio_for_qsv(self) -> None:
@@ -142,6 +248,22 @@ class OutputPathTests(unittest.TestCase):
             Path(first).write_bytes(b"existing")
             second = converter.output_path_for(str(src), preset, tmp)
             self.assertNotEqual(first, second)
+
+
+class ThreadAllocationTests(unittest.TestCase):
+    def test_single_job_gets_all_cores(self) -> None:
+        self.assertEqual(converter.threads_for_job(16, 1), 16)
+
+    def test_cores_split_across_concurrent_jobs(self) -> None:
+        self.assertEqual(converter.threads_for_job(16, 4), 4)
+        self.assertEqual(converter.threads_for_job(8, 2), 4)
+
+    def test_never_below_one_thread(self) -> None:
+        self.assertEqual(converter.threads_for_job(16, 32), 1)
+        self.assertEqual(converter.threads_for_job(1, 8), 1)
+
+    def test_defensive_zero_jobs(self) -> None:
+        self.assertEqual(converter.threads_for_job(8, 0), 8)
 
 
 class CropTests(unittest.TestCase):
@@ -248,6 +370,40 @@ class ConversionTests(unittest.TestCase):
             )
             self.assertTrue(result.success, result.message)
             self.assertTrue(os.path.exists(dest))
+
+    def test_gif_from_source_with_audio_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "sample.mp4")
+            if not _make_sample(src):
+                self.skipTest("ffmpeg unavailable or failed to synthesize sample")
+
+            dest = os.path.join(tmp, "out.gif")
+            result = converter.convert(
+                src, dest, presets.PRESETS["gif"], threads=4
+            )
+            self.assertTrue(result.success, result.message)
+            self.assertTrue(os.path.exists(dest))
+            self.assertGreater(os.path.getsize(dest), 0)
+
+    def test_failed_hwaccel_falls_back_to_cpu(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "sample.mp4")
+            if not _make_sample(src):
+                self.skipTest("ffmpeg unavailable or failed to synthesize sample")
+
+            dest = os.path.join(tmp, "out.gif")
+            messages: list[str] = []
+            with mock.patch.dict(
+                presets._HWACCEL_INPUT, {"cuda": ["-hwaccel", "does_not_exist"]}
+            ):
+                result = converter.convert(
+                    src, dest, presets.PRESETS["gif"], threads=4,
+                    hwaccel="cuda",
+                    on_progress=lambda _f, m: messages.append(m),
+                )
+            self.assertTrue(result.success, result.message)
+            self.assertTrue(os.path.exists(dest))
+            self.assertTrue(any("retrying on CPU" in m for m in messages))
 
 
 if __name__ == "__main__":
